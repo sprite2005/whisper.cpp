@@ -1296,11 +1296,7 @@ static ggml_backend_t whisper_backend_init_gpu(const whisper_context_params & pa
     if (params.use_gpu) {
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev_cur = ggml_backend_dev_get(i);
-            enum ggml_backend_dev_type dev_type = ggml_backend_dev_type(dev_cur);
-            const char * dev_name = ggml_backend_dev_name(dev_cur);
-            WHISPER_LOG_INFO("%s: device %zu: %s (type: %d)\n", __func__, i, dev_name, dev_type);
-            if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                WHISPER_LOG_INFO("%s: found GPU device %zu: %s (type: %d, cnt: %d)\n", __func__, i, dev_name, dev_type, cnt);
+            if (ggml_backend_dev_type(dev_cur) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(dev_cur) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
                 if (cnt == params.gpu_device) {
                     dev = dev_cur;
                 }
@@ -6669,8 +6665,13 @@ static bool whisper_vad(
         }
 
         int silence_samples = 0.1 * WHISPER_SAMPLE_RATE;
-        int total_silence_samples = (vad_segments->data.size() > 1) ? (vad_segments->data.size() - 1) * silence_samples : 0;
-        int total_samples_needed = filtered_n_samples + total_silence_samples;
+        int inter_segment_silence_samples = (vad_segments->data.size() > 1) ? (vad_segments->data.size() - 1) * silence_samples : 0;
+
+        // Add 100ms of leading silence before the first segment to help whisper properly attend
+        // to initial words. Without this, the model can miss short initial speech segments.
+        int leading_silence_samples = silence_samples;
+
+        int total_samples_needed = leading_silence_samples + filtered_n_samples + inter_segment_silence_samples;
 
         WHISPER_LOG_INFO("%s: total duration of speech segments: %.2f seconds\n",
                         __func__, (float)filtered_n_samples / WHISPER_SAMPLE_RATE);
@@ -6683,7 +6684,15 @@ static bool whisper_vad(
             return false;
         }
 
-        int offset = 0;
+        // Fill leading silence with zeros
+        memset(filtered_samples.data(), 0, leading_silence_samples * sizeof(float));
+
+        // Add time mapping for the leading silence: processed time 0-100ms maps to original time of first segment start
+        int64_t first_segment_orig_start = vad_segments->data[0].start;
+        state->vad_mapping_table.push_back({0, first_segment_orig_start});
+        state->vad_mapping_table.push_back({samples_to_cs(leading_silence_samples), first_segment_orig_start});
+
+        int offset = leading_silence_samples;
         for (int i = 0; i < (int)vad_segments->data.size(); i++) {
             int segment_start_samples = cs_to_samples(vad_segments->data[i].start);
             int segment_end_samples   = cs_to_samples(vad_segments->data[i].end);
